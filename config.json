@@ -1,0 +1,18 @@
+{
+  "_help": "Overrides for common.py DEFAULT_CONFIG. Restart tracker.py after editing.",
+
+  "app_names": {
+    "kitty": "Kitty",
+    "code-oss": "VS Code",
+    "hypr-screentime": "Screen Time"
+  },
+
+  "_extra_sites_help": "[name, regex] matched case-insensitively against the tab title, checked before the built-in list",
+  "extra_sites": [
+    ["Hyprland Wiki", "wiki\\.hypr\\.land|Hyprland Wiki"]
+  ],
+
+  "ignore_classes": [],
+  "ignore_workspaces": [],
+  "retention_days": 30
+}

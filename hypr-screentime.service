@@ -1,0 +1,16 @@
+[Unit]
+Description=Hyprland screen time tracker
+Documentation=file://%h/.scripts/hyprland-screen_time/README.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.scripts/hyprland-screen_time/tracker.py
+Environment=PYTHONUNBUFFERED=1
+# started once; the script itself waits for Hyprland and survives logouts
+Restart=no
+# SIGTERM makes the tracker save usage.json before it exits
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

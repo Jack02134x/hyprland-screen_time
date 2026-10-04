@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Screen Time
+Comment=Hyprland screen time dashboard
+Exec=python3 /home/jack/.scripts/hyprland-screen_time/gui.py
+Icon=preferences-system-time
+Terminal=false
+Categories=Utility;
+StartupWMClass=hypr-screentime
