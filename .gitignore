@@ -2,6 +2,9 @@
 usage.json
 .usage.json.*
 
+# personal Claude Code settings
+.claude/settings.local.json
+
 # python
 __pycache__/
 *.pyc
