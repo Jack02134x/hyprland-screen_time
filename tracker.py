@@ -10,8 +10,12 @@ Only the *focused* window is ever counted, so apps parked in special
 workspaces (special:minimize, special:network_social, ...) only count while
 that special workspace is open and the app has focus.
 
-Nothing is counted while hyprlock is running, while all screens are off
-(DPMS), or while no window is focused.
+Apps that are playing audio (PipeWire / PulseAudio, via `pactl`) are counted
+too while they are not focused, e.g. YouTube in a background workspace. That
+time goes into a separate "audio" tree in usage.json.
+
+Nothing is counted while hyprlock is running or while all screens are off
+(DPMS). Focus time also stops while no window is focused.
 
 If Hyprland isn't running, the daemon waits for it (checking `hyprctl
 clients` every 5s), and after Hyprland exits it saves and waits again. So it
@@ -46,6 +50,9 @@ BROWSER_SUFFIX = re.compile(
 EDITOR_SUFFIX = re.compile(r"\s+-\s+(Code - OSS|Visual Studio Code|VSCodium|Cursor|Zed)$")
 TITLE_SPLIT = re.compile(r"\s+(?:-|—|–|\||·|•)\s+")
 CHROME_APP = re.compile(r"^(?:chrome|chromium|brave|msedge)-(.+?)__")
+# stream names that say nothing about the tab (Chromium and friends)
+GENERIC_STREAM_NAMES = {"", "playback", "audiostream", "audio stream", "audio-stream", "playstream",
+                        "output", "audiocallbackdriver", "simple dmb"}
 
 
 # ------------------------------------------------------------------ Hyprland IPC
@@ -239,6 +246,37 @@ class Classifier:
             return self.app_name(cls), title[:80]
         return self.app_name(cls), ""
 
+    def classify_audio(self, pid, binary, media, clients):
+        """(app, detail) for a playing stream, attributed to the window whose
+        process (or an ancestor of it, e.g. a browser's audio subprocess) owns
+        it. None when that window is ignored."""
+        by_pid = {}
+        for c in clients:
+            by_pid.setdefault(c.get("pid"), []).append(c)
+        cur, owner = pid, None
+        for _ in range(40):
+            if cur in by_pid:
+                owner = cur
+                break
+            st = proc_stat(cur) if cur > 1 else None
+            if not st:
+                break
+            cur = st[1]
+        if owner is None:  # no window, e.g. mpd or a pipewire client daemon
+            return self.app_name(binary), ""
+
+        wins = by_pid[owner]
+        win = next((w for w in wins if media and media in (w.get("title") or "")), wins[0])
+        ws = (win.get("workspace") or {}).get("name", "")
+        if win.get("class") in self.cfg["ignore_classes"] or ws in self.cfg["ignore_workspaces"]:
+            return None
+        low = (win.get("class") or "").lower()
+        if low in self.terminals:  # whatever in the terminal plays it (mpv, spotify_player, ...)
+            return self.app_name(win["class"]), process_label(pid) or binary
+        if low in self.browsers and media.lower() not in GENERIC_STREAM_NAMES:
+            return self.app_name(win["class"]), self.browser_detail(media)  # Firefox names streams after the tab
+        return self.classify(win)
+
 
 # ------------------------------------------------------------------ helpers
 
@@ -254,6 +292,34 @@ def hypridle_lock_timeout():
         if t and cmd and "lock" in cmd.group(1):
             best = min(best or 10**9, int(t.group(1)))
     return best
+
+
+def audio_streams(cfg):
+    """Sink inputs that are really playing: [(pid, binary, media_name)]."""
+    try:
+        out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
+                             capture_output=True, text=True, timeout=2)
+        streams = json.loads(out.stdout) if out.returncode == 0 else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    ignore = {x.lower() for x in cfg["audio_ignore"]}
+    found = []
+    for st in streams if isinstance(streams, list) else []:
+        if st.get("corked") or st.get("mute"):
+            continue
+        volumes = [ch.get("value", 1) for ch in (st.get("volume") or {}).values() if isinstance(ch, dict)]
+        if volumes and not any(volumes):
+            continue
+        props = st.get("properties") or {}
+        binary = props.get("application.process.binary") or props.get("application.name") or "unknown"
+        if {binary.lower(), (props.get("application.name") or "").lower()} & ignore:
+            continue
+        try:
+            pid = int(props.get("application.process.id"))
+        except (TypeError, ValueError):
+            pid = 0
+        found.append((pid, binary, props.get("media.name") or ""))
+    return found
 
 
 def focused_window(hypr, cfg):
@@ -301,11 +367,11 @@ class Tracker:
         self.status = {}
         self.status_written = 0.0
 
-    def add(self, day, app, detail, hour, secs, now):
-        node = self.data["days"].setdefault(day, {}).setdefault(app, {}).setdefault(detail, {})
+    def add(self, day, app, detail, hour, secs, now, tree="days"):
+        node = self.data.setdefault(tree, {}).setdefault(day, {}).setdefault(app, {}).setdefault(detail, {})
         node[hour] = node.get(hour, 0) + secs
         self.dirty = True
-        if self.rollback:
+        if self.rollback and tree == "days":  # only focus time is idle-rolled-back
             self.recent.append((now, day, app, detail, hour, secs))
             while self.recent and self.recent[0][0] < now - self.rollback - 5:
                 self.recent.popleft()
@@ -364,6 +430,21 @@ class Tracker:
         app, detail = self.classifier.classify(win)
         return app, detail, "active"
 
+    def sample_audio(self, focused):
+        """[(app, detail)] playing audio right now, minus the focused one."""
+        if not self.cfg["count_audio"]:
+            return []
+        streams = audio_streams(self.cfg)
+        if not streams:
+            return []
+        clients = self.hypr.query("clients") or []
+        out = []
+        for pid, binary, media in streams:
+            hit = self.classifier.classify_audio(pid, binary, media, clients)
+            if hit and hit != focused and hit not in out:
+                out.append(hit)
+        return out
+
     def run(self):
         interval = float(self.cfg["poll_interval"])
         flush_every = float(self.cfg["flush_interval"])
@@ -383,6 +464,8 @@ class Tracker:
                 if not self.hypr.alive():
                     raise ConnectionError("Hyprland socket is gone")
                 app, detail, state = self.sample()
+                quiet = state in ("locked", "screens off")
+                audio = [] if quiet else self.sample_audio((app, detail) if app else None)
             except (OSError, ValueError, subprocess.SubprocessError) as e:
                 if dead_since is None:
                     print(f"[screentime] can't reach Hyprland: {e}", flush=True)
@@ -399,10 +482,14 @@ class Tracker:
                 self.last_input = now  # unlocking takes input
             self.locked = state == "locked"
 
+            stamp = datetime.now()
+            day, hour = stamp.date().isoformat(), str(stamp.hour)
             if app:
-                stamp = datetime.now()
-                self.add(stamp.date().isoformat(), app, detail, str(stamp.hour), elapsed, now)
-            self.write_status(state=state, app=app, detail=detail)
+                self.add(day, app, detail, hour, elapsed, now)
+            for a_app, a_detail in audio:
+                self.add(day, a_app, a_detail, hour, elapsed, now, tree="audio")
+            self.write_status(state=state, app=app, detail=detail,
+                              audio=[f"{a} › {d}" if d else a for a, d in audio])
 
             if self.flush_requested or now - last_flush >= flush_every:
                 self.flush_requested = False
@@ -448,13 +535,21 @@ def main():
             return
         cfg = common.load_config()
         hypr = Hyprland()
+        classifier = Classifier(cfg)
         win, reason = focused_window(hypr, cfg)
         if not win:
             print(f"not counted: {reason}")
         else:
-            app, detail = Classifier(cfg).classify(win)
+            app, detail = classifier.classify(win)
             print(f"class={win.get('class')!r} title={win.get('title')!r}")
             print(f"  -> app={app!r} detail={detail!r} workspace={win['workspace']['name']!r}")
+        streams = audio_streams(cfg) if cfg["count_audio"] else []
+        clients = hypr.query("clients") or []
+        for pid, binary, media in streams:
+            hit = classifier.classify_audio(pid, binary, media, clients)
+            print(f"audio: pid={pid} {binary!r} {media!r} -> {hit}")
+        if not streams:
+            print("audio: nothing playing")
         return
 
     # As a system service this can start at boot, before /run/user/<uid> exists.
@@ -467,8 +562,9 @@ def main():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print("[screentime] tracker already running", flush=True)
-        return
+        # Don't exit: under Restart=always that would loop. Take over when the other one ends.
+        print("[screentime] another tracker is running, waiting for it to exit...", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
 
     common.migrate_old_data()
     tracker = Tracker()

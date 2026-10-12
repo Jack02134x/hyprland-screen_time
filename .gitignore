@@ -1,0 +1,7 @@
+# personal screen time data
+usage.json
+.usage.json.*
+
+# python
+__pycache__/
+*.pyc

@@ -30,6 +30,11 @@ DEFAULT_CONFIG = {
     # time before the lock is removed again. "auto" reads the lock timeout
     # from ~/.config/hypr/hypridle.conf, a number sets it, 0 disables it.
     "idle_rollback_seconds": "auto",
+    # Also count apps that are playing audio (PipeWire / PulseAudio sink inputs)
+    # while they are not focused. Paused, muted and 0% volume streams don't count.
+    "count_audio": True,
+    # application names / binaries whose audio never counts
+    "audio_ignore": ["speech-dispatcher", "easyeffects"],
     # class -> display name overrides (otherwise taken from .desktop files)
     "app_names": {},
     "browsers": [
@@ -106,10 +111,16 @@ def load_config():
 #   {"version": 1,
 #    "days": {"2026-10-04": {"Firefox": {"YouTube": {"14": 312.0, ...}, ...}, ...}}}
 #   day -> app -> detail ("" when the app has no breakdown) -> hour -> seconds
+#   "audio" has the same layout: time an app was playing audio while it was
+#   NOT the focused window. The GUI adds both trees together.
 
 
 def empty_data():
-    return {"version": 1, "days": {}}
+    return {"version": 1, "days": {}, "audio": {}}
+
+
+def trees(data):
+    return data["days"], data.setdefault("audio", {})
 
 
 def migrate_old_data():
@@ -154,11 +165,12 @@ def atomic_write_json(path, obj, indent=None):
 
 
 def save_data(data, path=None):
-    for apps in data["days"].values():
-        for details in apps.values():
-            for hours in details.values():
-                for h, s in hours.items():
-                    hours[h] = round(s, 1)
+    for tree in trees(data):
+        for apps in tree.values():
+            for details in apps.values():
+                for hours in details.values():
+                    for h, s in hours.items():
+                        hours[h] = round(s, 1)
     atomic_write_json(path or DATA_FILE, data, indent=1)
 
 
@@ -166,36 +178,50 @@ def prune(data, retention_days, today=None):
     """Delete every day older than the retention window."""
     today = today or date.today()
     cutoff = (today - timedelta(days=retention_days - 1)).isoformat()
-    for day in [d for d in data["days"] if d < cutoff]:
-        del data["days"][day]
+    for tree in trees(data):
+        for day in [d for d in tree if d < cutoff]:
+            del tree[day]
 
 
 # ------------------------------------------------------------- aggregation
 
 
+def _day_entries(data, days, audio=True):
+    """Yield (app, details) for each day, from the focus tree and optionally the audio tree."""
+    focus, sound = trees(data)
+    for tree in (focus, sound) if audio else (focus,):
+        for day in days:
+            yield from tree.get(day, {}).items()
+
+
 def app_totals(data, days):
     out = {}
-    for day in days:
-        for app, details in data["days"].get(day, {}).items():
-            out[app] = out.get(app, 0) + sum(sum(h.values()) for h in details.values())
+    for app, details in _day_entries(data, days):
+        out[app] = out.get(app, 0) + sum(sum(h.values()) for h in details.values())
     return out
+
+
+def audio_total(data, days):
+    """Seconds counted only because an unfocused app was playing audio."""
+    audio = trees(data)[1]
+    return sum(sum(h.values()) for day in days for details in audio.get(day, {}).values()
+               for h in details.values())
 
 
 def detail_totals(data, days):
     """{(app, detail): seconds} for every non-empty detail."""
     out = {}
-    for day in days:
-        for app, details in data["days"].get(day, {}).items():
-            for detail, hours in details.items():
-                if detail:
-                    out[(app, detail)] = out.get((app, detail), 0) + sum(hours.values())
+    for app, details in _day_entries(data, days):
+        for detail, hours in details.items():
+            if detail:
+                out[(app, detail)] = out.get((app, detail), 0) + sum(hours.values())
     return out
 
 
 def hourly(data, day):
     """[{app: seconds}] * 24 for one day."""
     out = [dict() for _ in range(24)]
-    for app, details in data["days"].get(day, {}).items():
+    for app, details in _day_entries(data, [day]):
         for hours in details.values():
             for h, s in hours.items():
                 slot = out[int(h)]

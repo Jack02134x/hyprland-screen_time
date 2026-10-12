@@ -714,9 +714,12 @@ class Window(QMainWindow):
             what = st.get("app") or ""
             if st.get("detail"):
                 what += f"  ›  {st['detail']}"
-            self.pill.setText(f"●  {what}")
+            text = f"●  {what}"
         else:
-            self.pill.setText(f"❙❙  Paused — {state}")
+            text = f"❙❙  Paused — {state}"
+        if st.get("audio"):
+            text += "   ♪  " + ", ".join(st["audio"])
+        self.pill.setText(text if len(text) <= 70 else text[:69] + "…")
 
     def start_tracker(self):
         if self.read_status():
@@ -823,7 +826,10 @@ class Window(QMainWindow):
         self.chart.set_data(columns, series, average, clickable=self.mode != "day")
 
         # tiles
-        self.t_total.set(common.fmt_duration(grand) if grand else "0m", self.delta_text(grand, days))
+        sub = [t for t in (self.delta_text(grand, days),) if t]
+        if audio := common.audio_total(self.data, days):
+            sub.append(f"incl. {common.fmt_duration(audio)} background audio")
+        self.t_total.set(common.fmt_duration(grand) if grand else "0m", " · ".join(sub))
         if self.mode == "day":
             self.t_second.title.setText("Peak hour")
             hours = [sum(c["values"].values()) for c in columns]

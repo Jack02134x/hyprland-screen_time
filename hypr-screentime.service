@@ -1,13 +1,19 @@
 [Unit]
 Description=Hyprland screen time tracker
-Documentation=file://%h/.scripts/hyprland-screen_time/README.md
+Documentation=file:///home/jack/.scripts/hyprland-screen_time/README.md
+# never give up restarting, however often it dies
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/python3 %h/.scripts/hyprland-screen_time/tracker.py
+User=jack
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PYTHONUNBUFFERED=1
-# started once; the script itself waits for Hyprland and survives logouts
-Restart=no
+Type=simple
+ExecStart=/usr/bin/python3 /home/jack/.scripts/hyprland-screen_time/tracker.py
+# always come back: after a crash, a kill, or even a clean exit
+# (only `systemctl stop` keeps it down). The script waits for login and Hyprland itself.
+Restart=always
+RestartSec=3
 # SIGTERM makes the tracker save usage.json before it exits
 KillSignal=SIGTERM
 TimeoutStopSec=10
