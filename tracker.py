@@ -14,7 +14,7 @@ Apps that are playing audio (PipeWire / PulseAudio, via `pactl`) are counted
 too while they are not focused, e.g. YouTube in a background workspace. That
 time goes into a separate "audio" tree in usage.json.
 
-Nothing is counted while hyprlock is running or while all screens are off
+Nothing is counted while a screen locker (hyprlock, swaylock, ...) is running or while all screens are off
 (DPMS). Focus time also stops while no window is focused.
 
 If Hyprland isn't running, the daemon waits for it (checking `hyprctl
@@ -145,6 +145,7 @@ class Classifier:
         self.editors = {c.lower() for c in cfg["editors"]}
         self.title_detail = {c.lower() for c in cfg["title_detail_classes"]}
         self.app_names = {k.lower(): v for k, v in cfg["app_names"].items()}
+        self.audio_sites = set(cfg["audio_sites"])
         self.desktop_names = self._scan_desktop_files()
 
     @staticmethod
@@ -273,8 +274,16 @@ class Classifier:
         low = (win.get("class") or "").lower()
         if low in self.terminals:  # whatever in the terminal plays it (mpv, spotify_player, ...)
             return self.app_name(win["class"]), process_label(pid) or binary
-        if low in self.browsers and media.lower() not in GENERIC_STREAM_NAMES:
-            return self.app_name(win["class"]), self.browser_detail(media)  # Firefox names streams after the tab
+        if low in self.browsers:
+            if media.lower() not in GENERIC_STREAM_NAMES:  # some browsers name the stream after the tab
+                return self.app_name(win["class"]), self.browser_detail(media)
+            # Firefox/Chromium say "AudioStream"/"Playback": take the window showing a known
+            # site (YouTube, ...). Without one we can't tell which tab plays, so no detail.
+            for w in wins:
+                app, detail = self.classify(w)
+                if detail in self.audio_sites:
+                    return app, detail
+            return self.app_name(win["class"]), ""
         return self.classify(win)
 
 
@@ -282,7 +291,7 @@ class Classifier:
 
 
 def hypridle_lock_timeout():
-    conf = read(Path.home() / ".config/hypr/hypridle.conf")
+    conf = read(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "hypr/hypridle.conf")
     best = None
     for block in re.findall(r"listener\s*\{(.*?)\}", conf, re.S):
         lines = [ln.split("#", 1)[0] for ln in block.splitlines()]
@@ -366,6 +375,8 @@ class Tracker:
         self.locked = False
         self.status = {}
         self.status_written = 0.0
+        self.since_key = None  # (state, app) the `since` timestamp belongs to
+        self.since = time.time()
 
     def add(self, day, app, detail, hour, secs, now, tree="days"):
         node = self.data.setdefault(tree, {}).setdefault(day, {}).setdefault(app, {}).setdefault(detail, {})
@@ -396,6 +407,10 @@ class Tracker:
 
     def write_status(self, **status):
         now = time.time()
+        key = (status.get("state"), status.get("app"))
+        if key != self.since_key:  # `since`: when the current app (or pause state) began
+            self.since_key, self.since = key, now
+        status["since"] = round(self.since, 1)
         if status != self.status or now - self.status_written > 5:
             self.status = status
             self.status_written = now
@@ -414,7 +429,7 @@ class Tracker:
 
     def sample(self):
         """Return (app, detail, state) for right now."""
-        if is_running("hyprlock"):
+        if any(is_running(name) for name in self.cfg["lockers"]):
             return None, None, "locked"
         win, reason = focused_window(self.hypr, self.cfg)
 

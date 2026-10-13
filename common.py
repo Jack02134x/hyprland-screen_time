@@ -10,6 +10,8 @@ from pathlib import Path
 APP_ID = "hypr-screentime"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
+# per-user overrides on top of the repo's config.json, so `git pull` never conflicts
+USER_CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_ID / "config.json"
 DATA_FILE = SCRIPT_DIR / "usage.json"
 OLD_DATA_FILE = Path.home() / ".local/share" / APP_ID / "usage.json"  # pre-move location
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
@@ -26,6 +28,8 @@ DEFAULT_CONFIG = {
     # window classes / workspace names that are never counted, even when focused
     "ignore_classes": [],
     "ignore_workspaces": [],
+    # screen lockers: nothing is counted while one of these processes runs
+    "lockers": ["hyprlock", "swaylock", "gtklock", "waylock"],
     # When hyprlock starts after a period with no cursor movement, the idle
     # time before the lock is removed again. "auto" reads the lock timeout
     # from ~/.config/hypr/hypridle.conf, a number sets it, 0 disables it.
@@ -33,6 +37,11 @@ DEFAULT_CONFIG = {
     # Also count apps that are playing audio (PipeWire / PulseAudio sink inputs)
     # while they are not focused. Paused, muted and 0% volume streams don't count.
     "count_audio": True,
+    # Browsers don't say which tab plays audio, so it goes to a window showing one of these
+    # sites (names from "sites" / "extra_sites"); otherwise to the browser with no detail.
+    "audio_sites": ["YouTube Music", "YouTube", "Anikoto", "HiAnime", "Crunchyroll", "Netflix",
+                    "Prime Video", "Twitch", "Spotify", "Discord", "WhatsApp", "Telegram",
+                    "Instagram", "Facebook", "X", "Reddit"],
     # application names / binaries whose audio never counts
     "audio_ignore": ["speech-dispatcher", "easyeffects"],
     # class -> display name overrides (otherwise taken from .desktop files)
@@ -92,16 +101,17 @@ DEFAULT_CONFIG = {
 
 def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    if CONFIG_FILE.exists():
+    for path in (CONFIG_FILE, USER_CONFIG_FILE):  # later files win
+        if not path.exists():
+            continue
         try:
-            user = json.loads(CONFIG_FILE.read_text())
+            user = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as e:
-            print(f"[screentime] ignoring broken {CONFIG_FILE}: {e}")
-            user = {}
+            print(f"[screentime] ignoring broken {path}: {e}")
+            continue
         for k, v in user.items():
-            if k.startswith("_"):
-                continue
-            cfg[k] = v
+            if not k.startswith("_"):
+                cfg[k] = v
     return cfg
 
 
