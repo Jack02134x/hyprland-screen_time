@@ -1,5 +1,7 @@
 # Hyprland screen time
 
+![Screen Time dashboard, Day view](assets/preview.png)
+
 - `tracker.py`: a daemon that samples the focused Hyprland client once a second and adds the time to `usage.json` in this folder. If Hyprland isn't running (`hyprctl clients` fails), it waits quietly and starts tracking once Hyprland is up. When Hyprland exits, it saves and waits for the next session.
 - `gui.py`: a PySide6 dashboard with Day, 7 Days and 30 Days views.
 
@@ -32,6 +34,8 @@ Keys in the GUI:
 - `q` or `Esc` closes the window.
 
 Click a day's column in the 7 Days or 30 Days chart to open that day.
+
+**Colours follow your wallpaper**, in light and dark mode. The GUI reads the first palette it finds: `theme_files` in `config.json`, then the Prism shell's `~/.config/quickshell/.state/palette.json`, then pywal's `~/.cache/wal/colors.json`. It recolours live when the wallpaper changes. Each app gets the same colour as in Prism's Screen time tab, unless that colour is too close to one already on the chart; then it gets the next distinct one, falling back to a colour-blind-safe set.
 
 ## Install
 

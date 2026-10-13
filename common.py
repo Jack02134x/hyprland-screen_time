@@ -44,6 +44,9 @@ DEFAULT_CONFIG = {
                     "Instagram", "Facebook", "X", "Reddit"],
     # application names / binaries whose audio never counts
     "audio_ignore": ["speech-dispatcher", "easyeffects"],
+    # GUI colours: palette JSON files (matugen or pywal), first readable one wins;
+    # ~/.cache/wal/colors.json is always tried last. The GUI recolours when they change.
+    "theme_files": [],
     # class -> display name overrides (otherwise taken from .desktop files)
     "app_names": {},
     "browsers": [

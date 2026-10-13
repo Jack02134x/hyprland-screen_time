@@ -9,8 +9,8 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter,
+from PySide6.QtCore import QFileSystemWatcher, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics, QGuiApplication, QKeySequence, QPainter,
                            QPainterPath, QPen, QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QHBoxLayout, QLabel, QMainWindow,
                                QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
@@ -18,7 +18,10 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QHBoxLayout, 
 import common
 
 # Categorical slots validated (CVD + contrast) against a dark #101418 surface.
-SERIES = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]
+# Fallback chart colours when the palette has no accents; CVD/contrast-validated per mode.
+SERIES_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9"]
+SERIES_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7"]
+MAX_SERIES = 8  # more apps than this fold into "Other"
 OTHER = "Other"
 
 
@@ -32,28 +35,176 @@ def mix(a, b, t):
                   round(a.blue() + (b.blue() - a.blue()) * t)).name()
 
 
+HEX = __import__("re").compile(r"^#?[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$")
+WAL_FILE = Path.home() / ".cache/wal/colors.json"
+
+
+PRISM_PALETTE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "quickshell/.state/palette.json"
+
+
+def theme_files():
+    """Palette files, best first: config "theme_files", Prism's live palette, then pywal."""
+    cfg = common.load_config()
+    files = [Path(os.path.expanduser(f)) for f in cfg.get("theme_files", []) if f]
+    return files + [PRISM_PALETTE, WAL_FILE]
+
+
+def luminance(c):
+    def lin(v):
+        v /= 255
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+    c = QColor(c)
+    return 0.2126 * lin(c.red()) + 0.7152 * lin(c.green()) + 0.0722 * lin(c.blue())
+
+
+def contrast(a, b):
+    la, lb = sorted((luminance(a), luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def legible(color, surface, toward, ratio=3.0):
+    """Nudge a mark colour toward `toward` until it reaches `ratio`:1 against `surface`."""
+    for i in range(11):
+        c = mix(color, toward, i * 0.08)
+        if contrast(c, surface) >= ratio:
+            return c
+    return c
+
+
+def oklab(c):
+    def lin(v):
+        v /= 255
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+    c = QColor(c)
+    r, g, b = lin(c.red()), lin(c.green()), lin(c.blue())
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+
+
+def distinct(a, b, min_de=0.08):
+    """Far enough apart in OKLab to tell two neighbouring bars apart."""
+    return sum((x - y) ** 2 for x, y in zip(oklab(a), oklab(b))) ** 0.5 >= min_de
+
+
+def prism_hash(name):
+    """Prism's per-app colour index: h = (h*31 + charCode) | 0 over UTF-16 code units."""
+    h = 0
+    units = name.encode("utf-16-le")
+    for i in range(0, len(units), 2):
+        h = (h * 31 + int.from_bytes(units[i:i + 2], "little")) & 0xFFFFFFFF
+    if h >= 1 << 31:
+        h -= 1 << 32
+    return abs(h)
+
+
+def read_palette(path):
+    """{"bg", "fg", "accent", optional "card", "border"} from a matugen or pywal JSON file, or None.
+
+    Understands flat Material keys ({"surface": "#.."}), matugen --json output
+    ({"colors": {"dark": {...}}} or {"colors": {"surface": {"dark": "#.."}}}),
+    {"default": {"hex": ..}} template values, and pywal ({"colors": {"color0": ..}})."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    root = data.get("colors", data) if isinstance(data.get("colors"), dict) else data
+    if isinstance(root.get("dark"), dict):  # {"dark": {...}, "light": {...}}
+        root = root["dark"]
+
+    def pick(*names):
+        for name in names:
+            v = root.get(name)
+            if isinstance(v, dict):  # per-key variants
+                v = v.get("dark") or v.get("default") or v.get("hex")
+                if isinstance(v, dict):
+                    v = v.get("hex") or v.get("color")
+            if isinstance(v, str) and HEX.match(v.strip()):
+                v = v.strip()
+                return (v if v.startswith("#") else "#" + v)[:7]
+        return None
+
+    if "color0" in root:  # pywal
+        return {"bg": pick("color0"), "fg": pick("color7", "color15"), "accent": pick("color2", "color4")}
+    pal = {"bg": pick("surface", "background", "surface_dim"),
+           "fg": pick("on_surface", "on_background"),
+           "accent": pick("primary", "accent"),
+           "on_accent": pick("on_primary"),
+           "card": pick("surface_container", "surface_container_low"),
+           "raised": pick("surface_container_high"),
+           "fg2": pick("on_surface_variant"),
+           "border": pick("outline_variant")}
+    if not (pal["bg"] and pal["fg"] and pal["accent"]):
+        return None
+    # Prism's extras (~/.config/quickshell/.state/palette.json)
+    accents = [a for a in data.get("accents") or [] if isinstance(a, str) and HEX.match(a)]
+    pal["accents"] = accents or None
+    pal["fonts"] = data.get("fonts") if isinstance(data.get("fonts"), dict) else {}
+    pal["radius"] = data.get("radius") if isinstance(data.get("radius"), dict) else {}
+    return pal
+
+
 class Theme:
     def __init__(self):
-        bg, fg, accent = "#101418", "#e1e2e8", "#9fcafc"
-        try:
-            wal = json.loads((Path.home() / ".cache/wal/colors.json").read_text())["colors"]
-            bg, fg, accent = wal["color0"], wal["color7"], wal["color2"]
-        except (OSError, KeyError, ValueError):
-            pass
-        if QColor(bg).lightnessF() > 0.5:  # keep the validated dark palette readable
-            bg, fg = "#101418", "#e1e2e8"
-        self.bg = bg
-        self.fg = fg
-        self.accent = accent
-        self.surface = mix(bg, fg, 0.045)
-        self.surface2 = mix(bg, fg, 0.09)
-        self.border = mix(bg, fg, 0.12)
-        self.grid = mix(bg, fg, 0.08)
-        self.baseline = mix(bg, fg, 0.2)
-        self.secondary = mix(fg, bg, 0.25)
-        self.muted = mix(fg, bg, 0.48)
-        self.other = mix(bg, fg, 0.38)
-        self.accent_bg = mix(bg, accent, 0.2)
+        self.source = None
+        self.load()
+
+    def load(self):
+        pal = None
+        for path in theme_files():
+            if pal := read_palette(path):
+                self.source = path
+                break
+        else:
+            self.source = None
+        pal = pal or {"bg": "#101418", "fg": "#e1e2e8", "accent": "#9fcafc"}
+        bg, fg, accent = pal["bg"], pal["fg"], pal["accent"]
+        self.light = QColor(bg).lightnessF() > 0.5
+        self.bg, self.fg, self.accent = bg, fg, accent
+        self.surface = pal.get("card") or mix(bg, fg, 0.045)          # cards / panels
+        self.raised = pal.get("raised") or mix(self.surface, fg, 0.05)  # tooltips
+        self.surface2 = mix(self.surface, accent, 0.12)                # hover
+        self.border = pal.get("border") or mix(bg, fg, 0.12)
+        self.grid = mix(self.surface, self.border, 0.55)
+        self.baseline = self.border
+        self.secondary = pal.get("fg2") or mix(fg, bg, 0.25)
+        self.muted = legible(mix(self.secondary, self.surface, 0.3), self.surface, fg, 3.0)
+        self.other = legible(mix(self.surface, fg, 0.35), self.surface, fg, 2.0)
+        self.on_accent = pal.get("on_accent") or ("#000000" if luminance(accent) > 0.4 else "#ffffff")
+        accents = pal.get("accents")
+        self.by_name = bool(accents)  # Prism's accents: same app -> same colour as Prism's tab
+        base = accents or (SERIES_LIGHT if self.light else SERIES_DARK)
+        self.series = [legible(c, self.surface, fg, 2.0) for c in base]
+        def radius(key, default):
+            v = (pal.get("radius") or {}).get(key)
+            return int(v) if isinstance(v, (int, float)) and 0 <= v <= 40 else default
+        self.r_sm, self.r_md, self.r_lg = radius("sm", 8), radius("md", 10), radius("lg", 14)
+        fonts = pal.get("fonts") or {}
+        families = set(QFontDatabase.families())
+        self.ui_font = fonts.get("ui") if fonts.get("ui") in families else None
+        self.mono_font = fonts.get("mono") if fonts.get("mono") in families else None
+
+    def assign(self, ranked_apps):
+        """{app: colour} for the top apps, in rank order. Prism's slot when it's free,
+        otherwise the next free one, so two apps never share a colour."""
+        fallback = SERIES_LIGHT if self.light else SERIES_DARK
+        out, used = {}, []
+        for i, app in enumerate(ranked_apps[:MAX_SERIES]):
+            start = prism_hash(app) % len(self.series) if self.by_name else i
+            # the app's own slot if it's distinct from the colours already used, else the next one;
+            # Prism's accents can repeat or be near-identical, so then the validated set fills in
+            order = [self.series[(start + k) % len(self.series)] for k in range(len(self.series))]
+            pick = next((c for c in order + fallback if all(distinct(c, u) for u in used)), None)
+            if pick is None:
+                break  # rest fold into "Other"
+            used.append(pick)
+            out[app] = pick
+        return out
 
 
 T = None  # set in main()
@@ -65,14 +216,14 @@ def qss():
     QLabel {{ color: {T.fg}; background: transparent; }}
     QLabel[role="muted"] {{ color: {T.muted}; }}
     QLabel[role="secondary"] {{ color: {T.secondary}; }}
-    QFrame#card {{ background: {T.surface}; border: 1px solid {T.border}; border-radius: 14px; }}
-    QFrame#seg {{ background: {T.surface}; border: 1px solid {T.border}; border-radius: 10px; }}
+    QFrame#card {{ background: {T.surface}; border: 1px solid {T.border}; border-radius: {T.r_lg}px; }}
+    QFrame#seg {{ background: {T.surface}; border: 1px solid {T.border}; border-radius: {T.r_md}px; }}
     QFrame#seg QPushButton {{ background: transparent; color: {T.secondary}; border: none;
-        padding: 6px 18px; border-radius: 7px; font-weight: 600; }}
+        padding: 6px 18px; border-radius: {max(2, T.r_md - 3)}px; font-weight: 600; }}
     QFrame#seg QPushButton:hover {{ color: {T.fg}; }}
-    QFrame#seg QPushButton:checked {{ background: {T.accent_bg}; color: {T.fg}; }}
+    QFrame#seg QPushButton:checked {{ background: {T.accent}; color: {T.on_accent}; }}
     QPushButton#nav {{ background: {T.surface}; color: {T.fg}; border: 1px solid {T.border};
-        border-radius: 8px; min-width: 30px; min-height: 30px; font-size: 15px; }}
+        border-radius: {T.r_sm}px; min-width: 30px; min-height: 30px; font-size: 15px; }}
     QPushButton#nav:hover {{ background: {T.surface2}; }}
     QPushButton#nav:disabled {{ color: {T.border}; }}
     QPushButton#pill {{ background: {T.surface}; color: {T.secondary}; border: 1px solid {T.border};
@@ -87,8 +238,10 @@ def qss():
     """
 
 
-def font(size, weight=QFont.Weight.Normal):
+def font(size, weight=QFont.Weight.Normal, mono=False):
     f = QFont(QApplication.font())
+    if mono and T and T.mono_font:
+        f.setFamily(T.mono_font)
     f.setPixelSize(size)
     f.setWeight(weight)
     return f
@@ -217,7 +370,7 @@ class StackedBars(QWidget):
             return pl.bottom() - v / top * pl.height()
 
         # gridlines + y ticks
-        p.setFont(font(11))
+        p.setFont(font(11, mono=True))
         v = 0
         while v <= top:
             y = y_of(v)
@@ -302,8 +455,8 @@ class StackedBars(QWidget):
         box = QRectF(max(0, x), y, w, h)
 
         p.setPen(QPen(QColor(T.border), 1))
-        p.setBrush(QColor(T.surface2))
-        p.drawRoundedRect(box, 8, 8)
+        p.setBrush(QColor(T.raised))
+        p.drawRoundedRect(box, T.r_sm, T.r_sm)
         inner = box.adjusted(12, 8, -12, 0)
         p.setFont(f_title)
         p.setPen(QColor(T.fg))
@@ -390,7 +543,7 @@ class Row(QWidget):
         if self._hover and self.expandable:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(T.surface2))
-            p.drawRoundedRect(r, 8, 8)
+            p.drawRoundedRect(r, T.r_md, T.r_md)
 
         x = r.left() + 10 + self.indent
         text_h = 22
@@ -403,7 +556,7 @@ class Row(QWidget):
 
         time_txt = common.fmt_duration(self.seconds)
         f_name = font(13 if not self.compact else 12, QFont.Weight.Medium if not self.compact else QFont.Weight.Normal)
-        f_time = font(12)
+        f_time = font(12, mono=True)
         right = r.right() - 10
         if self.expandable:
             p.setPen(QColor(T.muted))
@@ -765,7 +918,7 @@ class Window(QMainWindow):
     def color_map(self):
         """Stable colors: rank apps over all stored history, so a filter never repaints an app."""
         ranked = sorted(common.app_totals(self.data, self.data["days"].keys()).items(), key=lambda kv: -kv[1])
-        return {app: SERIES[i] for i, (app, _) in enumerate(ranked[:len(SERIES)])}
+        return T.assign([app for app, _ in ranked])
 
     def render(self):
         today = date.today()
@@ -819,7 +972,7 @@ class Window(QMainWindow):
             self.chart_title.setText("Usage by day")
             active = [sum(c["values"].values()) for c in columns if c["values"]]
             average = sum(active) / len(active) if active else None
-        series = [(app, color) for app, color in sorted(cmap.items(), key=lambda kv: SERIES.index(kv[1]))
+        series = [(app, color) for app, color in cmap.items()
                   if app in series_used]
         if OTHER in series_used:
             series.append((OTHER, T.other))
@@ -889,9 +1042,44 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Screen Time")
     T = Theme()
+
+    def apply_font():
+        f = QFont(app.font())
+        if T.ui_font:
+            f.setFamily(T.ui_font)
+        app.setFont(f)
+
+    apply_font()
     app.setStyleSheet(qss())
     w = Window()
     w.show()
+
+    # Recolour live when the wallpaper palette changes. Watch the folders too:
+    # matugen and pywal replace the file, which drops a plain file watch.
+    watcher = QFileSystemWatcher(app)
+    debounce = QTimer(app, singleShot=True, interval=300)
+
+    def rewatch():
+        paths = [str(f) for f in theme_files() if f.exists()]
+        paths += [str(f.parent) for f in theme_files() if f.parent.is_dir()]
+        if watcher.files() + watcher.directories():
+            watcher.removePaths(watcher.files() + watcher.directories())
+        if paths:
+            watcher.addPaths(sorted(set(paths)))
+
+    def recolour():
+        T.load()
+        apply_font()
+        app.setStyleSheet(qss())
+        w.render()
+        for widget in app.allWidgets():
+            widget.update()
+        rewatch()
+
+    debounce.timeout.connect(recolour)
+    watcher.fileChanged.connect(lambda _: debounce.start())
+    watcher.directoryChanged.connect(lambda _: debounce.start())
+    rewatch()
     sys.exit(app.exec())
 
 
