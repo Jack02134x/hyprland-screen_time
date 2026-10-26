@@ -367,7 +367,7 @@ class Tracker:
 
         rb = self.cfg["idle_rollback_seconds"]
         self.rollback = (hypridle_lock_timeout() or 0) if rb == "auto" else int(rb or 0)
-        self.recent = deque()  # (monotonic, day, app, detail, hour, seconds)
+        self.recent = deque()  # (monotonic, day, app, detail, hour, seconds, audio_too)
         self.last_input = time.monotonic()
         self.last_cursor = None
         self.last_address = None
@@ -378,12 +378,18 @@ class Tracker:
         self.since_key = None  # (state, app) the `since` timestamp belongs to
         self.since = time.time()
 
-    def add(self, day, app, detail, hour, secs, now, tree="days"):
+    def add_active(self, day, hour, secs):
+        """Real screen time: called once per tick in which anything was counted."""
+        node = self.data.setdefault("active", {}).setdefault(day, {})
+        node[hour] = max(0.0, node.get(hour, 0) + secs)
+        self.dirty = True
+
+    def add(self, day, app, detail, hour, secs, now, tree="days", audio_too=False):
         node = self.data.setdefault(tree, {}).setdefault(day, {}).setdefault(app, {}).setdefault(detail, {})
         node[hour] = node.get(hour, 0) + secs
         self.dirty = True
         if self.rollback and tree == "days":  # only focus time is idle-rolled-back
-            self.recent.append((now, day, app, detail, hour, secs))
+            self.recent.append((now, day, app, detail, hour, secs, audio_too))
             while self.recent and self.recent[0][0] < now - self.rollback - 5:
                 self.recent.popleft()
 
@@ -396,11 +402,13 @@ class Tracker:
             return
         removed = 0.0
         while self.recent and self.recent[-1][0] > now - min(idle_for, self.rollback):
-            _, day, app, detail, hour, secs = self.recent.pop()
+            _, day, app, detail, hour, secs, audio_too = self.recent.pop()
             node = self.data["days"].get(day, {}).get(app, {}).get(detail, {})
             if hour in node:
                 node[hour] = max(0.0, node[hour] - secs)
                 removed += secs
+                if not audio_too:  # audio was playing, so that second still counts as screen time
+                    self.add_active(day, hour, -secs)
         self.recent.clear()
         self.dirty = True
         print(f"[screentime] idle lock detected, removed {removed:.0f}s of idle time", flush=True)
@@ -500,9 +508,11 @@ class Tracker:
             stamp = datetime.now()
             day, hour = stamp.date().isoformat(), str(stamp.hour)
             if app:
-                self.add(day, app, detail, hour, elapsed, now)
+                self.add(day, app, detail, hour, elapsed, now, audio_too=bool(audio))
             for a_app, a_detail in audio:
                 self.add(day, a_app, a_detail, hour, elapsed, now, tree="audio")
+            if app or audio:
+                self.add_active(day, hour, elapsed)
             self.write_status(state=state, app=app, detail=detail,
                               audio=[f"{a} › {d}" if d else a for a, d in audio])
 

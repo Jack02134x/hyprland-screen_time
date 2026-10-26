@@ -125,11 +125,13 @@ def load_config():
 #    "days": {"2026-10-04": {"Firefox": {"YouTube": {"14": 312.0, ...}, ...}, ...}}}
 #   day -> app -> detail ("" when the app has no breakdown) -> hour -> seconds
 #   "audio" has the same layout: time an app was playing audio while it was
-#   NOT the focused window. The GUI adds both trees together.
+#   NOT the focused window. The GUI adds both trees together for per-app times.
+#   "active": {day: {hour: seconds}} is real screen time: each second in which
+#   anything was counted (focus or audio) counts once, so an hour never passes 3600.
 
 
 def empty_data():
-    return {"version": 1, "days": {}, "audio": {}}
+    return {"version": 1, "days": {}, "audio": {}, "active": {}}
 
 
 def trees(data):
@@ -184,6 +186,9 @@ def save_data(data, path=None):
                 for hours in details.values():
                     for h, s in hours.items():
                         hours[h] = round(s, 1)
+    for hours in data.setdefault("active", {}).values():
+        for h, s in hours.items():
+            hours[h] = round(s, 1)
     atomic_write_json(path or DATA_FILE, data, indent=1)
 
 
@@ -191,7 +196,7 @@ def prune(data, retention_days, today=None):
     """Delete every day older than the retention window."""
     today = today or date.today()
     cutoff = (today - timedelta(days=retention_days - 1)).isoformat()
-    for tree in trees(data):
+    for tree in (*trees(data), data.setdefault("active", {})):
         for day in [d for d in tree if d < cutoff]:
             del tree[day]
 
@@ -229,6 +234,40 @@ def detail_totals(data, days):
             if detail:
                 out[(app, detail)] = out.get((app, detail), 0) + sum(hours.values())
     return out
+
+
+def screen_hours(data, day):
+    """[seconds] * 24 of real screen time, each at most 3600.
+
+    Uses the tracker's "active" record. Hours from before it existed are estimated:
+    only one window is ever focused, so focus time is exact real time, and background
+    audio almost always played during it (a video while you work). The estimate is the
+    focus time, or the longest single audio stream if that is longer (audio while no
+    window was focused)."""
+    focus, sound = trees(data)
+    rec = data.get("active", {}).get(day, {})
+    out = []
+    for h in range(24):
+        f = sum(hrs.get(str(h), 0) for details in focus.get(day, {}).values() for hrs in details.values())
+        r = rec.get(str(h))
+        if r is not None:
+            out.append(min(3600.0, max(r, f)))
+        else:
+            per_app = [sum(hrs.get(str(h), 0) for hrs in details.values()) for details in sound.get(day, {}).values()]
+            out.append(min(3600.0, max([f] + per_app)))
+    return out
+
+
+def estimated_hours(data, day):
+    """Hours of `day` that have app time but no real-time record (before 2026-10-26)."""
+    rec = data.get("active", {}).get(day, {})
+    used = {h for _, details in _day_entries(data, [day]) for hrs in details.values()
+            for h, s in hrs.items() if s > 0}
+    return {int(h) for h in used if h not in rec}
+
+
+def screen_total(data, days):
+    return sum(sum(screen_hours(data, d)) for d in days)
 
 
 def hourly(data, day):

@@ -350,7 +350,7 @@ class StackedBars(QWidget):
         p.setFont(font(12))
         legend_h = self._legend_height(p)
 
-        totals = [sum(c["values"].values()) for c in self.columns]
+        totals = [self._height(c) for c in self.columns]
         peak = max(totals + [self.average or 0, 1])
         step = nice_step(peak)
         top = step * max(1, -(-peak // step))
@@ -394,7 +394,9 @@ class StackedBars(QWidget):
                 p.setBrush(QColor(T.surface2))
                 p.drawRoundedRect(QRectF(cx - slot / 2 + 1, pl.top(), slot - 2, pl.height()), 6, 6)
 
-            stacks = [(name, color, col["values"].get(name, 0)) for name, color in self.series]
+            # apps can overlap (focus + background audio), so scale the stack to real screen time
+            k = self._height(col) / (sum(col["values"].values()) or 1)
+            stacks = [(name, color, col["values"].get(name, 0) * k) for name, color in self.series]
             stacks = [s for s in stacks if s[2] > 0]
             base = 0.0
             for j, (name, color, val) in enumerate(stacks):
@@ -435,17 +437,31 @@ class StackedBars(QWidget):
         if 0 <= self.hover < len(self.columns):
             self._tooltip(p, self.hover)
 
+    @staticmethod
+    def _height(col):
+        apps = sum(col["values"].values())
+        return min(apps, col["screen"]) if col.get("screen") is not None else apps
+
     def _tooltip(self, p, i):
         col = self.columns[i]
-        total = sum(col["values"].values())
+        total = self._height(col)
+        apps_sum = sum(col["values"].values())
+        overlap = apps_sum - total >= 60
         rows = [(n, c, col["values"].get(n, 0)) for n, c in self.series]
         rows = sorted([r for r in rows if r[2] > 0], key=lambda r: -r[2])
         f_title, f_row = font(12, QFont.Weight.DemiBold), font(12)
         fm, fmt = QFontMetrics(f_row), QFontMetrics(f_title)
         w = max([fmt.horizontalAdvance(col["title"]) + 90] +
                 [fm.horizontalAdvance(n) + fm.horizontalAdvance(common.fmt_duration(v)) + 50 for n, _, v in rows])
-        w = min(max(w, 190), 320)
-        h = 34 + 20 * len(rows) + (22 if self.clickable else 6)
+        notes = []
+        if overlap:  # e.g. a video playing while you work: apps overlap, the screen time doesn't
+            notes.append(f"Apps add up to {common.fmt_duration(apps_sum)} (they overlap)")
+        if col.get("estimated"):
+            notes.append("Estimated: from before real-time tracking")
+        fm11 = QFontMetrics(font(11))
+        w = max([w] + [fm11.horizontalAdvance(n) + 26 for n in notes])
+        w = min(max(w, 190), 340)
+        h = 34 + 20 * len(rows) + (22 if self.clickable else 6) + 18 * len(notes)
 
         cx = self.plot.left() + self._slot() * (i + 0.5)
         x = cx + self._slot() / 2 + 8
@@ -476,9 +492,12 @@ class StackedBars(QWidget):
             p.drawText(QRectF(inner.left(), yy, inner.width(), 20),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, common.fmt_duration(val))
             yy += 20
+        p.setFont(font(11))
+        p.setPen(QColor(T.muted))
+        for n in notes:
+            p.drawText(QRectF(inner.left(), yy + 2, inner.width(), 16), Qt.AlignmentFlag.AlignVCenter, n)
+            yy += 18
         if self.clickable:
-            p.setPen(QColor(T.muted))
-            p.setFont(font(11))
             p.drawText(QRectF(inner.left(), yy + 2, inner.width(), 16), Qt.AlignmentFlag.AlignVCenter,
                        "Click to open this day")
 
@@ -751,7 +770,7 @@ class Window(QMainWindow):
         # tiles
         tiles = QHBoxLayout()
         tiles.setSpacing(14)
-        self.t_total = Tile("Total screen time", hero=True)
+        self.t_total = Tile("Screen time", hero=True)
         self.t_second = Tile("Daily average")
         self.t_app = Tile("Most used app")
         self.t_act = Tile("Top activity")
@@ -933,7 +952,8 @@ class Window(QMainWindow):
         days = self.days()
         span = len(days)
         totals = common.app_totals(self.data, days)
-        grand = sum(totals.values())
+        apps_sum = sum(totals.values())
+        grand = common.screen_total(self.data, days)  # real screen time, overlaps counted once
 
         # header
         if self.mode == "day":
@@ -951,13 +971,16 @@ class Window(QMainWindow):
         series_used = set()
         columns = []
         if self.mode == "day":
+            screen = common.screen_hours(self.data, days[0])
+            est = common.estimated_hours(self.data, days[0])
             for h, slot in enumerate(common.hourly(self.data, days[0])):
                 vals = {}
                 for app, s in slot.items():
                     vals[series_of(app)] = vals.get(series_of(app), 0) + s
                 series_used |= set(vals)
                 columns.append({"label": f"{h:02d}", "title": f"{h:02d}:00 – {(h + 1) % 24:02d}:00", "key": h,
-                                "values": vals, "emph": self.anchor == today and h == datetime.now().hour})
+                                "values": vals, "screen": screen[h], "estimated": h in est,
+                                "emph": self.anchor == today and h == datetime.now().hour})
             self.chart_title.setText("Usage by hour")
             average = None
         else:
@@ -968,9 +991,11 @@ class Window(QMainWindow):
                 series_used |= set(vals)
                 dd = date.fromisoformat(d)
                 columns.append({"label": dd.strftime("%a %-d") if span <= 7 else dd.strftime("%-d"),
-                                "title": dd.strftime("%A, %-d %b"), "key": d, "values": vals, "emph": dd == today})
+                                "title": dd.strftime("%A, %-d %b"), "key": d, "values": vals,
+                                "screen": common.screen_total(self.data, [d]),
+                                "estimated": bool(common.estimated_hours(self.data, d)), "emph": dd == today})
             self.chart_title.setText("Usage by day")
-            active = [sum(c["values"].values()) for c in columns if c["values"]]
+            active = [StackedBars._height(c) for c in columns if c["values"]]
             average = sum(active) / len(active) if active else None
         series = [(app, color) for app, color in cmap.items()
                   if app in series_used]
@@ -980,12 +1005,14 @@ class Window(QMainWindow):
 
         # tiles
         sub = [t for t in (self.delta_text(grand, days),) if t]
-        if audio := common.audio_total(self.data, days):
-            sub.append(f"incl. {common.fmt_duration(audio)} background audio")
+        if apps_sum - grand >= 60:
+            sub.append(f"apps add up to {common.fmt_duration(apps_sum)}")
+        if any(c.get("estimated") for c in columns):
+            sub.append("partly estimated")
         self.t_total.set(common.fmt_duration(grand) if grand else "0m", " · ".join(sub))
         if self.mode == "day":
             self.t_second.title.setText("Peak hour")
-            hours = [sum(c["values"].values()) for c in columns]
+            hours = [StackedBars._height(c) for c in columns]
             if any(hours):
                 h = max(range(24), key=lambda i: hours[i])
                 self.t_second.set(f"{h:02d}:00 – {(h + 1) % 24:02d}:00", f"{common.fmt_duration(hours[h])} on screen")
@@ -999,7 +1026,7 @@ class Window(QMainWindow):
         ranked = sorted(totals.items(), key=lambda kv: -kv[1])
         if ranked:
             app, s = ranked[0]
-            self.t_app.set(app, f"{common.fmt_duration(s)} · {s / grand:.0%} of total")
+            self.t_app.set(app, f"{common.fmt_duration(s)} · {s / apps_sum:.0%} of app time")
         else:
             self.t_app.set("—", "")
         acts = sorted(common.detail_totals(self.data, days).items(), key=lambda kv: -kv[1])
@@ -1024,7 +1051,7 @@ class Window(QMainWindow):
         prev_end = date.fromisoformat(days[0]) - timedelta(days=1)
         if prev_end < self.oldest():
             return ""
-        prev = sum(common.app_totals(self.data, self.days(prev_end, span)).values())
+        prev = common.screen_total(self.data, self.days(prev_end, span))
         if not prev:
             return ""
         what = "yesterday" if self.mode == "day" and self.anchor == date.today() else \
